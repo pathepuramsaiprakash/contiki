@@ -75,16 +75,23 @@
 #include "net/uip-debug.h"
 #if DEBUG
 /* PRINTFI and PRINTFO are defined for input and output to debug one without changing the timing of the other */
+/* PRINTFSB is defined for debugging if the sicslowpan splitbuffer is used */
 uint8_t p;
 #include <stdio.h>
 #define PRINTFI(...) PRINTF(__VA_ARGS__)
 #define PRINTFO(...) PRINTF(__VA_ARGS__)
+#define PRINTFF(...) PRINTF(__VA_ARGS__)
+#define PRINTFSB(...) PRINTF(__VA_ARGS__)
+#define PRINTMACADDR(addr)  printf("%02x%02x:%02x%02x:%02x%02x:%02x%02x", (u8_t *)addr.u8[0], (u8_t *)addr.u8[1], (u8_t *)addr.u8[2], (u8_t *)addr.u8[3], (u8_t *)addr.u8[4], (u8_t *)addr.u8[5], (u8_t *)addr.u8[5], (u8_t *)addr.u8[7])
 #define PRINTPACKETBUF() PRINTF("RIME buffer: "); for(p = 0; p < packetbuf_datalen(); p++){PRINTF("%.2X", *(rime_ptr + p));} PRINTF("\n")
 #define PRINTUIPBUF() PRINTF("UIP buffer: "); for(p = 0; p < uip_len; p++){PRINTF("%.2X", uip_buf[p]);}PRINTF("\n")
 #define PRINTSICSLOWPANBUF() PRINTF("SICSLOWPAN buffer: "); for(p = 0; p < sicslowpan_len; p++){PRINTF("%.2X", sicslowpan_buf[p]);}PRINTF("\n")
 #else
 #define PRINTFI(...)
 #define PRINTFO(...)
+#define PRINTFF(...)
+#define PRINTFSB(...)
+#define PRINTMACADDR(...)
 #define PRINTPACKETBUF()
 #define PRINTUIPBUF()
 #define PRINTSICSLOWPANBUF()
@@ -111,6 +118,9 @@ void uip_log(char *msg);
 #define SICSLOWPAN_COMPRESSION SICSLOWPAN_COMPRESSION_IPV6
 #endif /* SICSLOWPAN_CONF_COMPRESSION */
 #endif /* SICSLOWPAN_COMPRESSION */
+
+#define WORD_OFFSET(b) ((b) / 8)
+#define BIT_OFFSET(b)  ((b) % 8)
 
 #define GET16(ptr,index) (((uint16_t)((ptr)[index] << 8)) | ((ptr)[(index) + 1]))
 #define SET16(ptr,index,value) do {     \
@@ -155,14 +165,6 @@ void uip_log(char *msg);
 /** @} */
 
 
-/** \brief Size of the 802.15.4 payload (127byte - 25 for MAC header) */
-#ifdef SICSLOWPAN_CONF_MAC_MAX_PAYLOAD
-#define MAC_MAX_PAYLOAD SICSLOWPAN_CONF_MAC_MAX_PAYLOAD
-#else /* SICSLOWPAN_CONF_MAC_MAX_PAYLOAD */
-#define MAC_MAX_PAYLOAD 102
-#endif /* SICSLOWPAN_CONF_MAC_MAX_PAYLOAD */
-
-
 /** \brief Some MAC layers need a minimum payload, which is
     configurable through the SICSLOWPAN_CONF_MIN_MAC_PAYLOAD
     option. */
@@ -201,6 +203,9 @@ static uint8_t rime_hdr_len;
  * or the UDP payload if the UDP header is also compressed)
  */
 static int rime_payload_len;
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+static u8_t backup_databuf_len;
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
 
 /**
  * uncomp_hdr_len is the length of the headers before compression (if HC2
@@ -221,12 +226,43 @@ static int last_tx_status;
 
 static uint16_t sicslowpan_len;
 
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
 /**
  * The buffer used for the 6lowpan reassembly.
  * This buffer contains only the IPv6 packet (no MAC header, 6lowpan, etc).
  * It has a fix size as we do not use dynamic memory allocation.
  */
+
+#if SICSLOWPAN_COMPRESSION != SICSLOWPAN_COMPRESSION_HC06
+#error SICSLOWPAN_CONF_SPLIT_BUFFER is currently only compatible with SICSLOWPAN_COMPRESSION_HC06
+#endif /* SICSLOWPAN_COMPRESSION != SICSLOWPAN_COMPRESSION_HC06 */
+
+// The buffer must be able to store the number of fragments needed to fill the uip buffer
+#if (UIP_BUFSIZE-80)%72
+#define SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES   (1 + (UIP_BUFSIZE-80)/72 + 1)
+#else
+#define SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES   (1 + (UIP_BUFSIZE-80)/72)
+#endif
+
+#define SICSLOWPAN_SPLIT_BUFFER_PAYLOAD_SIZE  SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES * SICSLOWPAN_SPLIT_BUFFER_FRAGMENT_LENGTH_MAX
+
+typedef union {
+  uint32_t u32[(UIP_BUFSIZE + 3) / 4];
+  uint8_t u8[UIP_BUFSIZE];
+  struct split_buffer_entry_t split_buffer_entries[SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES];
+} uip_split_buffer_t;
+
+#define uip_buf (uip_aligned_buf.u8)
+
+static uip_split_buffer_t sicslowpan_aligned_buf;
+#define split_buffer_entries (sicslowpan_aligned_buf.split_buffer_entries)
+
+#else /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
 static uip_buf_t sicslowpan_aligned_buf;
+
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
 #define sicslowpan_buf (sicslowpan_aligned_buf.u8)
 
 /** The total length of the IPv6 packet in the sicslowpan_buf. */
@@ -240,6 +276,7 @@ static uint16_t processed_ip_in_len;
 /** Datagram tag to be put in the fragments I send. */
 static uint16_t my_tag;
 
+#if ! SICSLOWPAN_CONF_SPLIT_BUFFER
 /** When reassembling, the tag in the fragments being merged. */
 static uint16_t reass_tag;
 
@@ -248,6 +285,7 @@ rimeaddr_t frag_sender;
 
 /** Reassembly %process %timer. */
 static struct timer reass_timer;
+#endif /* ! SICSLOWPAN_CONF_SPLIT_BUFFER */
 
 /** @} */
 #else /* SICSLOWPAN_CONF_FRAG */
@@ -353,6 +391,523 @@ const uint8_t llprefix[] = {0xfe, 0x80};
 
 /* TTL uncompression values */
 static const uint8_t ttl_values[] = {0, 1, 64, 255};
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+/**
+ * functions for management of fragments in the split buffer
+ */
+struct split_buffer_state_entry_t split_buffer_state_entries_t[SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX];
+
+void split_buffer_state_entries_init(void)
+{
+  uint8_t i;
+  for (i = 0; i < SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX; i++)
+    split_buffer_state_entries_t[i].state = ROUTING_DECISION_EMPTY;
+}
+
+/** clear all buffer slots associated to a splitbuffer entry **/
+static void split_buffer_clear_brotherentries(const struct split_buffer_state_entry_t * const split_buffer_state_entry) {
+  uint8_t i;
+  for (i = 0; i < SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES; i++) {
+    if (split_buffer_entries[i].split_buffer_state_entry == split_buffer_state_entry) {
+      split_buffer_clear_entry(i);
+    }
+  }
+}
+
+static void fragment_drop_split_buffer_entry(struct split_buffer_state_entry_t *found_entry)
+{
+  found_entry->state = ROUTING_DECISION_DROP;
+  //Delete all cached fragments
+  split_buffer_clear_brotherentries(found_entry);
+}
+
+struct split_buffer_state_entry_t* split_buffer_state_entry_create(const rimeaddr_t *src, uint16_t tag, uint16_t size)
+{
+  uint8_t i;
+  for (i = 0; i < SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX; i++) {
+    if ((split_buffer_state_entries_t[i].state == ROUTING_DECISION_TIMEOUT) ||
+        (split_buffer_state_entries_t[i].state == ROUTING_DECISION_EMPTY)) {
+           goto create;
+    }
+  }
+  /* If there is no free entry, use the oldest.
+   * This is only one possible policy,
+   * but its guaranteed to always result in a usable entry.
+   * It ignores the state, but will hit timeouted entries first, if they exist.
+   * Other possibilities:
+   * - the entry that is missing the most fragments
+   * - the entry that didn't receive a fragment for the largest time
+   * - ...
+   */
+#if SICSLOWPAN_CONF_FWCE_FIFO
+  uint8_t oldest_timer_index = 0;
+  clock_time_t oldest_timer_start = split_buffer_state_entries_t[oldest_timer_index].time_firstreceived;
+  for (i = 1; i < SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX; i++) {
+    if (oldest_timer_start > split_buffer_state_entries_t[i].time_firstreceived) {
+      oldest_timer_start = split_buffer_state_entries_t[i].time_firstreceived;
+      oldest_timer_index = i;
+    }
+  }
+  i = oldest_timer_index;
+  //clear buffers associated with this entry
+  fragment_drop_split_buffer_entry(&split_buffer_state_entries_t[i]);
+  goto create;
+#endif /*SICSLOWPAN_CONF_FWCE_FIFO*/
+  return 0;
+
+create:
+  rimeaddr_copy(&split_buffer_state_entries_t[i].src_mac_addr, src);
+  split_buffer_state_entries_t[i].fragment_tag = tag;
+  split_buffer_state_entries_t[i].reassembled_size = size;
+  split_buffer_state_entries_t[i].processed_ip_len = 0;
+  split_buffer_state_entries_t[i].frag2_payload_len = 0;
+  split_buffer_state_entries_t[i].state = ROUTING_DECISION_UNDECIDED;
+  split_buffer_state_entries_t[i].time_firstreceived = clock_time();
+
+#if SICSLOWPAN_REPUTATION_SHORTTIME
+  split_buffer_state_entries_t[i].rec_fragments = 0;
+#endif /* SICSLOWPAN_REPUTATION_SHORTTIME */
+
+  PRINTFSB("SplitBuf create %d\n", i);
+  return &split_buffer_state_entries_t[i];
+}
+
+struct split_buffer_state_entry_t* split_buffer_state_entry_get(const rimeaddr_t *src, const rimeaddr_t *dst, uint16_t tag, uint16_t size)
+{
+  uint8_t i;
+  for (i = 0; i < SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX; i++) {
+     if (rimeaddr_cmp(&split_buffer_state_entries_t[i].src_mac_addr, src) &&
+         (split_buffer_state_entries_t[i].fragment_tag == tag) &&
+         (split_buffer_state_entries_t[i].reassembled_size == size)) {
+       PRINTFSB("SplitBuf found %d\n", i);
+       return &split_buffer_state_entries_t[i];
+    }
+  }
+  PRINTFSB("SplitBuf No entry\n");
+  return 0;
+}
+
+void split_buffer_state_entry_check_timers(void)
+{
+  uint8_t i;
+  for (i = 0; i < SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX; i++)
+    if ((split_buffer_state_entries_t[i].state != ROUTING_DECISION_EMPTY) &&
+            (split_buffer_state_entries_t[i].state != ROUTING_DECISION_TIMEOUT))
+      if (SICSLOWPAN_REASS_MAXAGE*CLOCK_SECOND < clock_time() - split_buffer_state_entries_t[i].time_firstreceived) {
+        split_buffer_clear_brotherentries(&split_buffer_state_entries_t[i]);
+        split_buffer_state_entries_t[i].state = ROUTING_DECISION_TIMEOUT;
+      }
+}
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+/**
+ * Functions to operate on fragments in the split buffer
+ */
+
+void split_buffer_init()
+{
+  uint8_t i;
+  for (i = 0; i < SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES; i++)
+
+    split_buffer_clear_entry(i);
+}
+
+void split_buffer_clear_entry(uint8_t i)
+{
+  split_buffer_entries[i].split_buffer_state_entry = 0;
+  split_buffer_entries[i].data_len = 0;
+  memset(split_buffer_entries[i].data, 0, SICSLOWPAN_SPLIT_BUFFER_FRAGMENT_LENGTH_MAX);
+}
+
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+/**
+ * Functions to manage the reputation of fragments in the split buffer.
+ * Reputation helps to decide which fragments should be dropped if fragments
+ * of different packets are received at the same time and the split buffer
+ * has no space for storing the incoming fragment.
+ */
+
+#if SICSLOWPAN_REPUTATION_SHORTTIME
+/**
+ * get the reputation of a split_buffer_state_entry that is not the entry of the currently
+ * processed fragment
+ * @param found_entry   the splitbuffer entry
+ * @return  current reputation
+ */
+static uint16_t reputation_get(struct split_buffer_state_entry_t *found_entry){
+  // all reputation values are normalized such that 100 is the best and 0 is the worst reputation
+
+  int i;
+  uint16_t reputation = found_entry->reputation_shorttime;
+  clock_time_t time_since_last = clock_time() - found_entry->time_lastreceived;
+
+  clock_time_t upper_bound = found_entry->average_sending_rate + REPUTATION_SHORTTIME_WINDOW;
+  if(upper_bound < found_entry->average_sending_rate){
+    // wraparound
+    upper_bound = 0xffffffff;
+  }
+
+  /* we do not consider the case of lower bound as this function is only called for split_buffer_state_entries_t
+   * that are distinct from the entry of the currently processed fragment.
+   * Thus, they have not send too fast as there is currently no fragment received for this observation.
+   */
+  if(time_since_last < upper_bound || found_entry->average_sending_rate == 0){
+    // everything ok
+  }else{
+    // sender is too slow
+    for(i=1; i< time_since_last/found_entry->average_sending_rate; i++){
+      reputation = reputation / 2;
+    }
+  }
+
+  PRINTFSB("time-since-last-frag: %lu    average-timer: %lu  \n",
+        (clock_time() - found_entry->time_lastreceived),
+        found_entry->average_sending_rate);
+  PRINTFSB("reputation %u\n", reputation);
+
+  return reputation;
+}
+
+/**
+ * update the shorttime reputation of the given entry.
+ * MUST ONLY be called for a entry of which a fragment was received
+ * @param found_entry split_buffer entry
+ * @return  updated reputation
+ */
+static uint16_t reputation_get_updated(struct split_buffer_state_entry_t *found_entry){
+
+  int i;
+  uint16_t reputation = found_entry->reputation_shorttime;
+  clock_time_t time_since_last = clock_time() - found_entry->time_lastreceived;
+
+  clock_time_t upper_bound = found_entry->average_sending_rate + REPUTATION_SHORTTIME_WINDOW;
+  if(upper_bound < found_entry->average_sending_rate){
+    // wraparound
+    upper_bound = 0xffffffff;
+  }
+
+  clock_time_t lower_bound = found_entry->average_sending_rate - REPUTATION_SHORTTIME_WINDOW;
+  if(lower_bound > found_entry->average_sending_rate){
+    // wraparound
+    lower_bound = 0;
+  }
+
+  PRINTFSB("%lu < %lu < %lu ? || %u == 0\n", lower_bound, time_since_last, upper_bound, found_entry->average_sending_rate);
+  if((time_since_last < upper_bound && time_since_last > lower_bound) || found_entry->average_sending_rate == 0 ){
+    // increase reputation by fragment size
+
+    /* get size of complete ip packet
+     * the ip length is encoded in the first two byte of the fragment, but
+     * the first 5 bits represent the fragment type (first fragment or fragment)
+     */
+    uint8_t* dataptr = (uint8_t *)packetbuf_dataptr();
+    uint16_t ip_size = (((dataptr)[0] & 0b00000111) << 8) | dataptr[1];
+
+    uint16_t fragment_size = packetbuf_hdrlen() + packetbuf_datalen();
+
+    if(ip_size == 0){
+      // avoid division by zero
+      // todo check if an attacker could get to this point, otherwise remove the check
+      reputation = 0;
+    }else{
+      reputation += fragment_size * 100 / ip_size;
+    }
+
+  }else{
+    // sender is too slow or too fast
+    if(found_entry->average_sending_rate == 0){
+      // >>todo check assumption!<< this should only happen if we have only received one fragment -> do nothing
+    }else{
+      // reputation = reputation / (2^(l/a))
+      i = 0;
+      do{
+        reputation = reputation / 2;
+        i++;
+      }while(i < time_since_last/found_entry->average_sending_rate);
+    }
+  }
+  PRINTFSB("updated reputation: %u\n", reputation);
+
+  return reputation;
+
+}
+#endif /* SICSLOWPAN_REPUTATION_SHORTTIME */
+
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+/**
+ * Functions to insert and retrieve fragments from the split buffer
+ */
+
+/* \brief                    Store a fragment
+ * \param found_entry        pointing to the entry in splitbuffer for these fragments
+ *
+ * split_buffer_state_entry_t keeps the information about the fragments, such as src,
+ * dst address, etc. All the fragments of a packet in bufferentrie point to their
+ * corresponding split_buffer_state_entry.
+ */
+static void split_buffer_store(struct split_buffer_state_entry_t *found_entry, uint8_t first_fragment)
+{
+  uint8_t i;
+  uint8_t target = 0;
+  // Fill buffers from last to first, to keep first empty as long as possible for other processes writing there
+  for (i = SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES; i>0; i--) {
+
+    // Use First free buffer
+    if (split_buffer_entries[i-1].split_buffer_state_entry == 0) {
+      target = i;
+      break;
+    }
+  }
+
+  /* No space found, now find a packet to throw out */
+#if SICSLOWPAN_REPUTATION_SHORTTIME
+
+  // the rec_fragments counter is usually incremented by FRAG_CHAINING functions
+  found_entry->rec_fragments++;
+
+  clock_time_t current_time = clock_time();
+
+  // update average timer
+  if(found_entry->rec_fragments > 1){
+    found_entry->average_sending_rate = (current_time - found_entry->time_firstreceived) / (found_entry->rec_fragments - 1);
+  }else{
+    // this is the first fragment
+    found_entry->average_sending_rate = 0;
+    found_entry->reputation_shorttime = 0;
+  }
+
+  PRINTFSB("new avg sendingrate %lu = %lu / %u\n",
+      found_entry->average_sending_rate,
+      current_time - found_entry->time_firstreceived,
+      found_entry->rec_fragments - 1);
+
+  if (target == 0) {
+    // only remove split_buffer_state_entry if they have at most the reputation of the current split_buffer_state_entry
+    uint16_t worst_reputation = reputation_get_updated(found_entry);
+
+    // find a bufferentry of the split_buffer_state_entry with lower reputation
+    /* todo it would also be possible to search the split_buffer_state_entry array for
+     * the entry with the lowest reputation and then search a bufferentry of this
+     * this would result in less runtime as the split_buffer_entries array is large, but
+     * increases the code size as an additional for-loop would be needed
+     */
+    struct split_buffer_state_entry_t *split_buffer_target_entry = 0;
+    for (i = 0; i<SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX; i++){
+
+      // we do not want to overwrite the current found_entry
+      if( &(split_buffer_state_entries_t[i]) != found_entry
+          && split_buffer_state_entries_t[i].state != ROUTING_DECISION_DROP
+          && split_buffer_state_entries_t[i].state != ROUTING_DECISION_EMPTY
+          && split_buffer_state_entries_t[i].state != ROUTING_DECISION_TIMEOUT){
+
+        uint16_t this_reputation = reputation_get( &(split_buffer_state_entries_t[i]) );
+
+        if( this_reputation <= worst_reputation){
+          worst_reputation = this_reputation;
+          split_buffer_target_entry = &(split_buffer_state_entries_t[i]);
+        }
+      }
+
+    }
+
+    if(split_buffer_target_entry != 0){
+      // there is a entry with lower or equal reputation, delete this entry
+      fragment_drop_split_buffer_entry(split_buffer_target_entry);
+    }
+
+    for (i = SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES; i>0; i--) {
+
+      // Use First free buffer
+      if (split_buffer_entries[i-1].split_buffer_state_entry == 0) {
+        target = i;
+        break;
+      }
+    }
+  }
+#else /* SICSLOWPAN_REPUTATION_SHORTTIME */
+
+  /* If the split buffer is active and no further fragment can be stored
+   * and SICSLOWPAN_REPUTATION_SHORTTIME is not activated,
+   * we drop the fragments of the oldest packet within the split buffer
+   */
+  if (target == 0) {
+
+  struct split_buffer_state_entry_t *split_buffer_target_entry = 0;
+    for (i = 0; i<SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX; i++){
+
+      // we do not want to overwrite the current found_entry
+      if( &(split_buffer_state_entries_t[i]) != found_entry
+          && split_buffer_state_entries_t[i].state != ROUTING_DECISION_DROP
+          && split_buffer_state_entries_t[i].state != ROUTING_DECISION_EMPTY
+          && split_buffer_state_entries_t[i].state != ROUTING_DECISION_TIMEOUT){
+
+        if( split_buffer_target_entry == 0
+            || split_buffer_state_entries_t[i].time_firstreceived < split_buffer_target_entry->time_firstreceived)
+        {
+          split_buffer_target_entry = &(split_buffer_state_entries_t[i]);
+        }
+      }
+
+    }
+
+    if(split_buffer_target_entry != 0){
+      // there is a entry with lower or equal reputation, delete this entry
+      fragment_drop_split_buffer_entry(split_buffer_target_entry);
+    }
+
+    for (i = SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES; i>0; i--) {
+
+      // Use First free buffer
+      if (split_buffer_entries[i-1].split_buffer_state_entry == 0) {
+        target = i;
+        break;
+      }
+    }
+
+  }
+
+#endif /* SICSLOWPAN_REPUTATION_SHORTTIME */
+
+  if (target != 0) {
+    split_buffer_entries[target - 1].split_buffer_state_entry = found_entry;
+    split_buffer_entries[target - 1].data_len = packetbuf_copyto(split_buffer_entries[target - 1].data);
+
+#if SICSLOWPAN_REPUTATION_SHORTTIME
+    found_entry->reputation_shorttime = reputation_get_updated(found_entry);
+
+    // update timer for calculation of short-time-reputation
+    found_entry->time_lastreceived = current_time;
+#endif /* SICSLOWPAN_REPUTATION_SHORTTIME */
+
+    backup_databuf_len = split_buffer_entries[target - 1].data_len;
+
+
+    if (found_entry->state == ROUTING_DECISION_KEEP
+        || found_entry->state == ROUTING_DECISION_UNDECIDED) {
+      found_entry->processed_ip_len += backup_databuf_len;
+    }
+    PRINTFSB("str %d\n", target-1);
+    return;
+  }
+
+  //Could not store fragment, make sure no other fragments for this packet get forwarded
+  PRINTFSB("NO STR DRP\n");
+  fragment_drop_split_buffer_entry(found_entry);
+}
+
+static void uncompress_hdr_hc06(uint16_t ip_len,
+                                struct uip_ip_hdr *IP_BUF,
+                                struct uip_udp_hdr *UDP_BUF,
+                                const rimeaddr_t *src,
+                                const rimeaddr_t *dst);
+
+/* \brief                    Reassembling received fragments
+ * \param found_entry        pointing the entry in splitbuffer entry for these fragments
+ * \param to                 pointing to the buffer holding the result of reassembling
+ *
+ * split_buffer_state_entry_t keeps the information about the fragments, such as src,
+ * dst address, etc.
+ */
+void fragment_restore_stored(struct split_buffer_state_entry_t *found_entry, void *to)
+{
+#if DEBUG
+  uint16_t tmp;
+  memset((uint8_t *)to, 0, found_entry->reassembled_size);
+#endif /* DEBUG */
+  uint8_t i;
+  uint8_t local_frag_offset; // counts frag offset in 8 byte units
+
+  //Restore FRAG1
+  for (i = 0; i < SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES; i++) {
+    if (split_buffer_entries[i].split_buffer_state_entry == found_entry) {
+      if (((GET16(split_buffer_entries[i].data, RIME_FRAG_DISPATCH_SIZE) & 0xf800) >> 8) == SICSLOWPAN_DISPATCH_FRAG1) {
+        PRINTFSB("rst %d\n", i);
+        local_frag_offset = 0;
+
+        rime_ptr = split_buffer_entries[i].data;
+        rime_hdr_len = SICSLOWPAN_FRAG1_HDR_LEN;
+
+        // FIXME check for other header types here, too.
+        uncomp_hdr_len = 0;
+        uncompress_hdr_hc06(found_entry->reassembled_size,
+                            UIP_IP_BUF,
+                            UIP_UDP_BUF,
+                            &found_entry->src_mac_addr,
+                            (rimeaddr_t*)&rimeaddr_node_addr);
+        //processed_ip_len += uncomp_hdr_len;
+
+#if DEBUG
+        PRINTFSB("decobuf: %d", uncomp_hdr_len);
+        for (tmp = 0; tmp < found_entry->reassembled_size; tmp++) {
+          if (tmp %64 == 0)
+            PRINTFSB("\n");
+          if (tmp %8 == 0)
+            PRINTFSB("_");
+          uint8_t data = ((uint8_t *)(to))[tmp];
+          PRINTFSB("%02x ", data);
+        }
+        PRINTFSB("\n");
+#endif /* DEBUG */
+
+        memcpy((uint8_t *)to + uncomp_hdr_len,
+            split_buffer_entries[i].data + rime_hdr_len,
+            split_buffer_entries[i].data_len - SICSLOWPAN_FRAG1_HDR_LEN);
+
+#if DEBUG
+        PRINTFSB("restorebuf:");
+        for (tmp = 0; tmp < found_entry->reassembled_size; tmp++) {
+          if (tmp %64 == 0)
+            PRINTFSB("\n");
+          if (tmp %8 == 0)
+            PRINTFSB("_");
+          uint8_t data = ((uint8_t *)(to))[tmp];
+          PRINTFSB("%02x ", data);
+        }
+        PRINTFSB("\n");
+#endif /* DEBUG */
+      }
+    }
+  }
+
+  //Restore all FRAGN
+  for (i = 0; i < SICSLOWPAN_SPLIT_BUFFER_NUM_ENTRIES; i++) {
+    if (split_buffer_entries[i].split_buffer_state_entry == found_entry) {
+      if (((GET16(split_buffer_entries[i].data, RIME_FRAG_DISPATCH_SIZE) & 0xf800) >> 8) == SICSLOWPAN_DISPATCH_FRAGN) {
+        PRINTFSB("rst %d\n", i);
+        local_frag_offset = split_buffer_entries[i].data[RIME_FRAG_OFFSET];
+
+        memcpy((uint8_t *)to + (uint16_t)(local_frag_offset << 3),
+                split_buffer_entries[i].data + SICSLOWPAN_FRAGN_HDR_LEN,
+                split_buffer_entries[i].data_len - SICSLOWPAN_FRAGN_HDR_LEN);
+
+#if DEBUG
+        PRINTFSB("restore bf:");
+        for (tmp = 0; tmp < found_entry->reassembled_size; tmp++) {
+          if (tmp %64 == 0)
+            PRINTFSB("\n");
+          if (tmp %8 == 0)
+            printf("_");
+          uint8_t data = ((uint8_t *)(to))[tmp];
+          PRINTFSB("%02x ", data);
+        }
+        PRINTFSB("\n");
+#endif /* DEBUG */
+      }
+    }
+  }
+
+  split_buffer_clear_brotherentries(found_entry);
+  found_entry->processed_ip_len = processed_ip_in_len;
+  found_entry->state = ROUTING_DECISION_EMPTY;
+}
+
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
 
 /*--------------------------------------------------------------------*/
 /** \name HC06 related functions
@@ -781,7 +1336,11 @@ compress_hdr_hc06(rimeaddr_t *rime_destaddr)
  * fragment.
  */
 static void
-uncompress_hdr_hc06(uint16_t ip_len)
+uncompress_hdr_hc06(uint16_t ip_len,
+                    struct uip_ip_hdr *ip_buf,
+                    struct uip_udp_hdr *udp_buf,
+                    const rimeaddr_t *src,
+                    const rimeaddr_t *dst)
 {
   uint8_t tmp, iphc0, iphc1;
   /* at least two byte will be used for the encoding */
@@ -801,22 +1360,22 @@ uncompress_hdr_hc06(uint16_t ip_len)
       /* Flow label are carried inline */
       if((iphc0 & SICSLOWPAN_IPHC_TC_C) == 0) {
         /* Traffic class is carried inline */
-        memcpy(&SICSLOWPAN_IP_BUF->tcflow, hc06_ptr + 1, 3);
+        memcpy(&ip_buf->tcflow, hc06_ptr + 1, 3);
         tmp = *hc06_ptr;
         hc06_ptr += 4;
         /* hc06 format of tc is ECN | DSCP , original is DSCP | ECN */
         /* set version, pick highest DSCP bits and set in vtc */
-        SICSLOWPAN_IP_BUF->vtc = 0x60 | ((tmp >> 2) & 0x0f);
+        ip_buf->vtc = 0x60 | ((tmp >> 2) & 0x0f);
         /* ECN rolled down two steps + lowest DSCP bits at top two bits */
-        SICSLOWPAN_IP_BUF->tcflow = ((tmp >> 2) & 0x30) | (tmp << 6) |
-  	(SICSLOWPAN_IP_BUF->tcflow & 0x0f);
+        ip_buf->tcflow = ((tmp >> 2) & 0x30) | (tmp << 6) |
+  	(ip_buf->tcflow & 0x0f);
       } else {
         /* Traffic class is compressed (set version and no TC)*/
-        SICSLOWPAN_IP_BUF->vtc = 0x60;
+        ip_buf->vtc = 0x60;
         /* highest flow label bits + ECN bits */
-        SICSLOWPAN_IP_BUF->tcflow = (*hc06_ptr & 0x0F) |
+        ip_buf->tcflow = (*hc06_ptr & 0x0F) |
   	((*hc06_ptr >> 2) & 0x30);
-        memcpy(&SICSLOWPAN_IP_BUF->flow, hc06_ptr + 1, 2);
+        memcpy(&ip_buf->flow, hc06_ptr + 1, 2);
         hc06_ptr += 3;
       }
     } else {
@@ -824,31 +1383,31 @@ uncompress_hdr_hc06(uint16_t ip_len)
       /* Version and flow label are compressed */
       if((iphc0 & SICSLOWPAN_IPHC_TC_C) == 0) {
         /* Traffic class is inline */
-          SICSLOWPAN_IP_BUF->vtc = 0x60 | ((*hc06_ptr >> 2) & 0x0f);
-          SICSLOWPAN_IP_BUF->tcflow = ((*hc06_ptr << 6) & 0xC0) | ((*hc06_ptr >> 2) & 0x30);
-          SICSLOWPAN_IP_BUF->flow = 0;
+          ip_buf->vtc = 0x60 | ((*hc06_ptr >> 2) & 0x0f);
+          ip_buf->tcflow = ((*hc06_ptr << 6) & 0xC0) | ((*hc06_ptr >> 2) & 0x30);
+          ip_buf->flow = 0;
           hc06_ptr += 1;
       } else {
         /* Traffic class is compressed */
-        SICSLOWPAN_IP_BUF->vtc = 0x60;
-        SICSLOWPAN_IP_BUF->tcflow = 0;
-        SICSLOWPAN_IP_BUF->flow = 0;
+        ip_buf->vtc = 0x60;
+        ip_buf->tcflow = 0;
+        ip_buf->flow = 0;
       }
     }
 
   /* Next Header */
   if((iphc0 & SICSLOWPAN_IPHC_NH_C) == 0) {
     /* Next header is carried inline */
-    SICSLOWPAN_IP_BUF->proto = *hc06_ptr;
-    PRINTF("IPHC: next header inline: %d\n", SICSLOWPAN_IP_BUF->proto);
+    ip_buf->proto = *hc06_ptr;
+    PRINTF("IPHC: next header inline: %d\n", ip_buf->proto);
     hc06_ptr += 1;
   }
 
   /* Hop limit */
   if((iphc0 & 0x03) != SICSLOWPAN_IPHC_TTL_I) {
-    SICSLOWPAN_IP_BUF->ttl = ttl_values[iphc0 & 0x03];
+    ip_buf->ttl = ttl_values[iphc0 & 0x03];
   } else {
-    SICSLOWPAN_IP_BUF->ttl = *hc06_ptr;
+    ip_buf->ttl = *hc06_ptr;
     hc06_ptr += 1;
   }
 
@@ -869,12 +1428,12 @@ uncompress_hdr_hc06(uint16_t ip_len)
       }
     }
     /* if tmp == 0 we do not have a context and therefore no prefix */
-    uncompress_addr(&SICSLOWPAN_IP_BUF->srcipaddr,
+    uncompress_addr(&ip_buf->srcipaddr,
                     tmp != 0 ? context->prefix : NULL, unc_ctxconf[tmp],
                     (uip_lladdr_t *)packetbuf_addr(PACKETBUF_ADDR_SENDER));
   } else {
     /* no compression and link local */
-    uncompress_addr(&SICSLOWPAN_IP_BUF->srcipaddr, llprefix, unc_llconf[tmp],
+    uncompress_addr(&ip_buf->srcipaddr, llprefix, unc_llconf[tmp],
                     (uip_lladdr_t *)packetbuf_addr(PACKETBUF_ADDR_SENDER));
   }
 
@@ -899,7 +1458,7 @@ uncompress_hdr_hc06(uint16_t ip_len)
         hc06_ptr++;
       }
 
-      uncompress_addr(&SICSLOWPAN_IP_BUF->destipaddr, prefix,
+      uncompress_addr(&ip_buf->destipaddr, prefix,
                       unc_mxconf[tmp], NULL);
     }
   } else {
@@ -915,12 +1474,12 @@ uncompress_hdr_hc06(uint16_t ip_len)
 	PRINTF("sicslowpan uncompress_hdr: error context not found\n");
 	return;
       }
-      uncompress_addr(&SICSLOWPAN_IP_BUF->destipaddr, context->prefix,
+      uncompress_addr(&ip_buf->destipaddr, context->prefix,
                       unc_ctxconf[tmp],
                       (uip_lladdr_t *)packetbuf_addr(PACKETBUF_ADDR_RECEIVER));
     } else {
       /* not context based => link local M = 0, DAC = 0 - same as SAC */
-      uncompress_addr(&SICSLOWPAN_IP_BUF->destipaddr, llprefix,
+      uncompress_addr(&ip_buf->destipaddr, llprefix,
                       unc_llconf[tmp],
                       (uip_lladdr_t *)packetbuf_addr(PACKETBUF_ADDR_RECEIVER));
     }
@@ -932,48 +1491,48 @@ uncompress_hdr_hc06(uint16_t ip_len)
     /* The next header is compressed, NHC is following */
     if((*hc06_ptr & SICSLOWPAN_NHC_UDP_MASK) == SICSLOWPAN_NHC_UDP_ID) {
       uint8_t checksum_compressed;
-      SICSLOWPAN_IP_BUF->proto = UIP_PROTO_UDP;
+      ip_buf->proto = UIP_PROTO_UDP;
       checksum_compressed = *hc06_ptr & SICSLOWPAN_NHC_UDP_CHECKSUMC;
       PRINTF("IPHC: Incoming header value: %i\n", *hc06_ptr);
       switch(*hc06_ptr & SICSLOWPAN_NHC_UDP_CS_P_11) {
       case SICSLOWPAN_NHC_UDP_CS_P_00:
 	/* 1 byte for NHC, 4 byte for ports, 2 bytes chksum */
-	memcpy(&SICSLOWPAN_UDP_BUF->srcport, hc06_ptr + 1, 2);
-	memcpy(&SICSLOWPAN_UDP_BUF->destport, hc06_ptr + 3, 2);
+	memcpy(&udp_buf->srcport, hc06_ptr + 1, 2);
+	memcpy(&udp_buf->destport, hc06_ptr + 3, 2);
 	PRINTF("IPHC: Uncompressed UDP ports (ptr+5): %x, %x\n",
-	       UIP_HTONS(SICSLOWPAN_UDP_BUF->srcport), UIP_HTONS(SICSLOWPAN_UDP_BUF->destport));
+	       UIP_HTONS(udp_buf->srcport), UIP_HTONS(udp_buf->destport));
 	hc06_ptr += 5;
 	break;
 
       case SICSLOWPAN_NHC_UDP_CS_P_01:
         /* 1 byte for NHC + source 16bit inline, dest = 0xF0 + 8 bit inline */
 	PRINTF("IPHC: Decompressing destination\n");
-	memcpy(&SICSLOWPAN_UDP_BUF->srcport, hc06_ptr + 1, 2);
-	SICSLOWPAN_UDP_BUF->destport = UIP_HTONS(SICSLOWPAN_UDP_8_BIT_PORT_MIN + (*(hc06_ptr + 3)));
+	memcpy(&udp_buf->srcport, hc06_ptr + 1, 2);
+	udp_buf->destport = UIP_HTONS(SICSLOWPAN_UDP_8_BIT_PORT_MIN + (*(hc06_ptr + 3)));
 	PRINTF("IPHC: Uncompressed UDP ports (ptr+4): %x, %x\n",
-	       UIP_HTONS(SICSLOWPAN_UDP_BUF->srcport), UIP_HTONS(SICSLOWPAN_UDP_BUF->destport));
+	       UIP_HTONS(udp_buf->srcport), UIP_HTONS(udp_buf->destport));
 	hc06_ptr += 4;
 	break;
 
       case SICSLOWPAN_NHC_UDP_CS_P_10:
         /* 1 byte for NHC + source = 0xF0 + 8bit inline, dest = 16 bit inline*/
 	PRINTF("IPHC: Decompressing source\n");
-	SICSLOWPAN_UDP_BUF->srcport = UIP_HTONS(SICSLOWPAN_UDP_8_BIT_PORT_MIN +
+	udp_buf->srcport = UIP_HTONS(SICSLOWPAN_UDP_8_BIT_PORT_MIN +
 					    (*(hc06_ptr + 1)));
-	memcpy(&SICSLOWPAN_UDP_BUF->destport, hc06_ptr + 2, 2);
+	memcpy(&udp_buf->destport, hc06_ptr + 2, 2);
 	PRINTF("IPHC: Uncompressed UDP ports (ptr+4): %x, %x\n",
-	       UIP_HTONS(SICSLOWPAN_UDP_BUF->srcport), UIP_HTONS(SICSLOWPAN_UDP_BUF->destport));
+	       UIP_HTONS(udp_buf->srcport), UIP_HTONS(udp_buf->destport));
 	hc06_ptr += 4;
 	break;
 
       case SICSLOWPAN_NHC_UDP_CS_P_11:
 	/* 1 byte for NHC, 1 byte for ports */
-	SICSLOWPAN_UDP_BUF->srcport = UIP_HTONS(SICSLOWPAN_UDP_4_BIT_PORT_MIN +
+	udp_buf->srcport = UIP_HTONS(SICSLOWPAN_UDP_4_BIT_PORT_MIN +
 					    (*(hc06_ptr + 1) >> 4));
-	SICSLOWPAN_UDP_BUF->destport = UIP_HTONS(SICSLOWPAN_UDP_4_BIT_PORT_MIN +
+	udp_buf->destport = UIP_HTONS(SICSLOWPAN_UDP_4_BIT_PORT_MIN +
 					     ((*(hc06_ptr + 1)) & 0x0F));
 	PRINTF("IPHC: Uncompressed UDP ports (ptr+2): %x, %x\n",
-	       UIP_HTONS(SICSLOWPAN_UDP_BUF->srcport), UIP_HTONS(SICSLOWPAN_UDP_BUF->destport));
+	       UIP_HTONS(udp_buf->srcport), UIP_HTONS(udp_buf->destport));
 	hc06_ptr += 2;
 	break;
 
@@ -982,7 +1541,7 @@ uncompress_hdr_hc06(uint16_t ip_len)
 	return;
       }
       if(!checksum_compressed) { /* has_checksum, default  */
-	memcpy(&SICSLOWPAN_UDP_BUF->udpchksum, hc06_ptr, 2);
+	memcpy(&udp_buf->udpchksum, hc06_ptr, 2);
 	hc06_ptr += 2;
 	PRINTF("IPHC: sicslowpan uncompress_hdr: checksum included\n");
       } else {
@@ -1003,17 +1562,17 @@ uncompress_hdr_hc06(uint16_t ip_len)
   if(ip_len == 0) {
     int len = packetbuf_datalen() - rime_hdr_len + uncomp_hdr_len - UIP_IPH_LEN;
     /* This is not a fragmented packet */
-    SICSLOWPAN_IP_BUF->len[0] = len >> 8;
-    SICSLOWPAN_IP_BUF->len[1] = len & 0x00FF;
+    ip_buf->len[0] = len >> 8;
+    ip_buf->len[1] = len & 0x00FF;
   } else {
     /* This is a 1st fragment */
-    SICSLOWPAN_IP_BUF->len[0] = (ip_len - UIP_IPH_LEN) >> 8;
-    SICSLOWPAN_IP_BUF->len[1] = (ip_len - UIP_IPH_LEN) & 0x00FF;
+    ip_buf->len[0] = (ip_len - UIP_IPH_LEN) >> 8;
+    ip_buf->len[1] = (ip_len - UIP_IPH_LEN) & 0x00FF;
   }
   
   /* length field in UDP header */
-  if(SICSLOWPAN_IP_BUF->proto == UIP_PROTO_UDP) {
-    memcpy(&SICSLOWPAN_UDP_BUF->udplen, &SICSLOWPAN_IP_BUF->len[0], 2);
+  if(ip_buf->proto == UIP_PROTO_UDP) {
+    memcpy(&udp_buf->udplen, &ip_buf->len[0], 2);
   }
 
   return;
@@ -1268,6 +1827,169 @@ uncompress_hdr_hc1(uint16_t ip_len)
 #endif /* SICSLOWPAN_COMPRESSION == SICSLOWPAN_COMPRESSION_HC1 */
 
 
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+/**
+ * Functions that handle incoming fragments with respect to the existence
+ * of the split buffer
+ */
+
+/* \brief                    This function takes over the processing of FRAG1s as
+ *                           required for enhanced route over and fragment chaining.
+ *                           If no entry in splitbuffer defined yet, this is defined
+ *                           in first step. Afterwards the anchor is initialized.
+ *
+ * \param frag_size          pointer to the in header indicated reassembled packet size
+ * \param frag_tag           pointer to the in header indicated fragment tag
+ * \return                   a pointer to the found_entry
+ */
+static struct split_buffer_state_entry_t*
+split_buffer_handle_frag1(uint16_t *frag_size, uint16_t *frag_tag)
+{
+    struct split_buffer_state_entry_t *found_entry;
+    found_entry = split_buffer_state_entry_get(packetbuf_addr(PACKETBUF_ADDR_SENDER),
+                                                packetbuf_addr(PACKETBUF_ADDR_RECEIVER),
+                                                *frag_tag,
+                                                *frag_size);
+    if (found_entry) {
+      if (found_entry->state == ROUTING_DECISION_DROP || found_entry->state == ROUTING_DECISION_TIMEOUT) {
+        PRINTFSB("DROP\n");
+        return NULL;
+      }
+    } else {
+      //printf("FRAG1: ");
+      found_entry = split_buffer_state_entry_create(packetbuf_addr(PACKETBUF_ADDR_SENDER), *frag_tag, *frag_size);
+      if (!found_entry) {
+        return NULL;
+      }
+    }
+    *frag_size = found_entry->reassembled_size;  //todo already read from buffer in input
+    sicslowpan_len = *frag_size;
+    processed_ip_in_len = found_entry->processed_ip_len;
+
+    return found_entry;
+}
+
+/* \brief                    This function takes over the processing of FRAGNs as
+ *                           required for enhanced route over and fragment chaining.
+ *                           If no entry in splitbuffer defined yet, this is defined
+ *                           in first step. Afterwards the fragment is verified.
+ *
+ * \param frag_size          pointer to the in header indicated reassembled packet size
+ * \param frag_tag           pointer to the in header indicated fragment tag
+ * \param frag_offset        pointer to the in header indicated offset of the current fragment
+ * \param last_fragment      indicating if this is the last fragment
+ * \return                   a pointer to the found_entry
+ */
+static struct split_buffer_state_entry_t*
+split_buffer_handle_fragn(uint16_t *frag_size,
+                           uint16_t *frag_tag,
+                           uint8_t  *frag_offset,
+                           uint8_t  *last_fragment)
+{
+      struct split_buffer_state_entry_t *found_entry;
+      found_entry = split_buffer_state_entry_get(packetbuf_addr(PACKETBUF_ADDR_SENDER),
+                                                  packetbuf_addr(PACKETBUF_ADDR_RECEIVER),
+                                                  *frag_tag,
+                                                  *frag_size);
+      PRINTFSB("FRAGN: ");
+      if (found_entry) {
+#if DEBUG
+        switch (found_entry->state) {
+          case ROUTING_DECISION_UNDECIDED:
+            puts("RD_UNDEC");
+            break;
+          case ROUTING_DECISION_KEEP:
+            puts("RD_KEEP");
+            break;
+          case ROUTING_DECISION_FORWARD:
+            puts("RD_FWD");
+            break;
+          case ROUTING_DECISION_EMPTY:
+            puts("RD_EMPTY");
+            break;
+          case ROUTING_DECISION_DROP:
+            puts("RD_DRP");
+            break;
+          case ROUTING_DECISION_TIMEOUT:
+            puts("RD_TOUT");
+        }
+#endif /* DEBUG == 1*/
+      } else {
+        PRINTFSB("FRAGN: ");
+        found_entry = split_buffer_state_entry_create(packetbuf_addr(PACKETBUF_ADDR_SENDER), *frag_tag, *frag_size);
+        if (!found_entry) {
+          return NULL;
+        }
+      }
+      *frag_size = found_entry->reassembled_size;
+      sicslowpan_len = *frag_size;
+      processed_ip_in_len = found_entry->processed_ip_len;
+      return found_entry;
+}
+
+/* \brief                    This function takes over the processing of all fragments,
+ *                           after they are processed specifically according their types,
+ *                           as required for enhanced route over and fragment chaining.
+ *                           In first step, fragment is verified, and further processing
+ *                           is dependent on the result of verification. If verification
+ *                           fails fragment is immediately dropped. On successful verification
+ *                           fragment is forwarded or stored, as defined in the routing
+ *                           decision.
+ *
+ * \param found_entry        pointer to the buffer holding the current fragment
+ * \param frag_size          pointer to the in header indicated reassembled packet size
+ * \param frag_tag           pointer to the in header indicated fragment tag
+ * \param frag_offset        pointer to the in header indicated offset of the current fragment
+ * \param last_fragment      indicating if this is the last fragment
+ * \param first_fragment     indicating if this is the first fragment
+ * \return                   success or failure
+ */
+static uint8_t
+split_buffer_handle_frag(struct split_buffer_state_entry_t *found_entry,
+                          uint16_t *frag_size,
+                          uint8_t  *frag_offset,
+                          uint8_t  *last_fragment,
+                          uint8_t  *first_fragment)
+{
+
+  if (found_entry->frag2_payload_len == 0 && !(*first_fragment) && !(*last_fragment)){
+       found_entry->frag2_payload_len = packetbuf_datalen() - rime_hdr_len;
+  }
+
+    if (*first_fragment) { //FRAG1
+
+      // Fragments have to be restored later, since the fragment cache and
+      // the reassembly buffer share the same memory space
+
+      /* todo check: everytime false
+      if (found_entry->state == ROUTING_DECISION_KEEP) {
+        fragment_restore_stored(found_entry, SICSLOWPAN_IP_BUF);
+      }*/
+
+      if(found_entry->state != ROUTING_DECISION_DROP && found_entry->state != ROUTING_DECISION_TIMEOUT){
+        split_buffer_store(found_entry, *first_fragment);
+      }else{
+        // drop
+        return 0;
+      }
+
+    } else { //FRAGN
+
+      if (found_entry->state == ROUTING_DECISION_UNDECIDED || found_entry->state == ROUTING_DECISION_KEEP){
+          split_buffer_store(found_entry, *first_fragment);
+      }
+
+    }
+
+    if ((found_entry->state == ROUTING_DECISION_DROP) || (found_entry->state == ROUTING_DECISION_TIMEOUT)) {
+      //PRINTFI("fragment for connection marked timeout or drop, stat %i\n",found_entry->state );
+      PRINTFSB("T or D, stat %i\n",found_entry->state );
+      return 0;
+    }
+
+    return 1;
+}
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
 
 /*--------------------------------------------------------------------*/
 /** \name IPv6 dispatch "compression" function
@@ -1560,6 +2282,7 @@ output(const uip_lladdr_t *localdest)
 #endif /* SICSLOWPAN_CONF_FRAG */
   } else {
 
+    PRINTFO("NO FRAGMENTATION! \n");
     /*
      * The packet does not need to be fragmented
      * copy "payload" and send
@@ -1597,6 +2320,10 @@ input(void)
   /* tag of the fragment */
   uint16_t frag_tag = 0;
   uint8_t first_fragment = 0, last_fragment = 0;
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+  struct split_buffer_state_entry_t *found_entry = 0;
+  backup_databuf_len = 0;
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
 #endif /*SICSLOWPAN_CONF_FRAG*/
 
   /* init */
@@ -1610,11 +2337,16 @@ input(void)
      want to query us for it later. */
   last_rssi = (signed short)packetbuf_attr(PACKETBUF_ATTR_RSSI);
 #if SICSLOWPAN_CONF_FRAG
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+  split_buffer_state_entry_check_timers();
+#else /* SICSLOWPAN_CONF_SPLIT_BUFFER */
   /* if reassembly timed out, cancel it */
   if(timer_expired(&reass_timer)) {
     sicslowpan_len = 0;
     processed_ip_in_len = 0;
   }
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
   /*
    * Since we don't support the mesh and broadcast header, the first header
    * we look for is the fragmentation header
@@ -1629,7 +2361,15 @@ input(void)
       frag_tag = GET16(RIME_FRAG_PTR, RIME_FRAG_TAG);
       PRINTFI("size %d, tag %d, offset %d)\n",
              frag_size, frag_tag, frag_offset);
+
       rime_hdr_len += SICSLOWPAN_FRAG1_HDR_LEN;
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+       found_entry = split_buffer_handle_frag1(&frag_size, &frag_tag);
+       if (!found_entry) {
+         return;
+       }
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
       /*      printf("frag1 %d %d\n", reass_tag, frag_tag);*/
       first_fragment = 1;
       is_fragment = 1;
@@ -1645,6 +2385,21 @@ input(void)
       frag_size = GET16(RIME_FRAG_PTR, RIME_FRAG_DISPATCH_SIZE) & 0x07ff;
       PRINTFI("size %d, tag %d, offset %d)\n",
              frag_size, frag_tag, frag_offset);
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+      if(frag_offset*8 + packetbuf_datalen() - rime_hdr_len >= frag_size) {
+        last_fragment = 1;
+      }
+
+      found_entry = split_buffer_handle_fragn(&frag_size,
+                                               &frag_tag,
+                                               &frag_offset,
+                                               &last_fragment);
+      if (!found_entry) {
+        return;
+      }
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
       rime_hdr_len += SICSLOWPAN_FRAGN_HDR_LEN;
 
       /* If this is the last fragment, we may shave off any extrenous
@@ -1658,8 +2413,19 @@ input(void)
       is_fragment = 1;
       break;
     default:
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+      found_entry = 0;
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
       break;
   }
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+  if (frag_size > SICSLOWPAN_SPLIT_BUFFER_PAYLOAD_SIZE) { // Rough ESTIMATE about usable payload per packet to calculate number of fragments
+    PRINTFSB("packet received is larger (%d) than reassembly buffer (%d). DROP.\n", frag_size, SICSLOWPAN_SPLIT_BUFFER_PAYLOAD_SIZE);
+    found_entry->state = ROUTING_DECISION_DROP;
+    return;
+  }
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
 
   /* We are currently reassembling a packet, but have just received the first
    * fragment of another packet. We can either ignore it and hope to receive
@@ -1670,7 +2436,7 @@ input(void)
    * This lessens the negative impacts of too high SICSLOWPAN_REASS_MAXAGE.
    */
 #define PRIORITIZE_NEW_PACKETS 1
-#if PRIORITIZE_NEW_PACKETS
+#if PRIORITIZE_NEW_PACKETS && ! SICSLOWPAN_CONF_SPLIT_BUFFER
 
   if(!is_fragment) {
     /* Prioritize non-fragment packets too. */
@@ -1681,8 +2447,9 @@ input(void)
     sicslowpan_len = 0;
     processed_ip_in_len = 0;
   }
-#endif /* PRIORITIZE_NEW_PACKETS */
+#endif /* PRIORITIZE_NEW_PACKETS && ! SICSLOWPAN_CONF_SPLIT_BUFFER */
 
+#if ! SICSLOWPAN_CONF_SPLIT_BUFFER
   if(processed_ip_in_len > 0) {
     /* reassembly is ongoing */
     /*    printf("frag %d %d\n", reass_tag, frag_tag);*/
@@ -1718,6 +2485,7 @@ input(void)
       rimeaddr_copy(&frag_sender, packetbuf_addr(PACKETBUF_ADDR_SENDER));
     }
   }
+#endif /* ! SICSLOWPAN_CONF_SPLIT_BUFFER */
 
   if(rime_hdr_len == SICSLOWPAN_FRAGN_HDR_LEN) {
     /* this is a FRAGN, skip the header compression dispatch section */
@@ -1729,7 +2497,11 @@ input(void)
 #if SICSLOWPAN_COMPRESSION == SICSLOWPAN_COMPRESSION_HC06
   if((RIME_HC1_PTR[RIME_HC1_DISPATCH] & 0xe0) == SICSLOWPAN_DISPATCH_IPHC) {
     PRINTFI("sicslowpan input: IPHC\n");
-    uncompress_hdr_hc06(frag_size);
+    uncompress_hdr_hc06(frag_size,
+                        SICSLOWPAN_IP_BUF,
+                        SICSLOWPAN_UDP_BUF,
+                        packetbuf_addr(PACKETBUF_ADDR_SENDER),
+                        packetbuf_addr(PACKETBUF_ADDR_RECEIVER));
   } else
 #endif /* SICSLOWPAN_COMPRESSION == SICSLOWPAN_COMPRESSION_HC06 */
     switch(RIME_HC1_PTR[RIME_HC1_DISPATCH]) {
@@ -1760,6 +2532,20 @@ input(void)
     
 #if SICSLOWPAN_CONF_FRAG
  copypayload:
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+  if (frag_size != 0) {
+    // if we have a fragmented packet
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+    if (split_buffer_handle_frag(found_entry,
+                                  &frag_size,
+                                  &frag_offset,
+                                  &last_fragment,
+                                  &first_fragment) == 0) {
+      return;
+    }
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+  }
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
 #endif /*SICSLOWPAN_CONF_FRAG*/
   /*
    * copy "payload" from the rime buffer to the sicslowpan_buf
@@ -1774,6 +2560,9 @@ input(void)
   }
   rime_payload_len = packetbuf_datalen() - rime_hdr_len;
 
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+  if(frag_size > 0) {
+#else /* SICSLOWPAN_CONF_SPLIT_BUFFER */
   /* Sanity-check size of incoming packet to avoid buffer overflow */
   {
     int req_size = UIP_LLH_LEN + uncomp_hdr_len + (uint16_t)(frag_offset << 3)
@@ -1788,6 +2577,12 @@ input(void)
   }
 
   memcpy((uint8_t *)SICSLOWPAN_IP_BUF + uncomp_hdr_len + (uint16_t)(frag_offset << 3), rime_ptr + rime_hdr_len, rime_payload_len);
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+  } else {
+    memcpy((uint8_t *)SICSLOWPAN_IP_BUF + uncomp_hdr_len + (uint16_t)(frag_offset << 3), rime_ptr + rime_hdr_len, rime_payload_len);
+  }
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
   
   /* update processed_ip_in_len if fragment, sicslowpan_len otherwise */
 
@@ -1804,6 +2599,10 @@ input(void)
     } else {
       processed_ip_in_len += rime_payload_len;
     }
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+    found_entry->processed_ip_len = processed_ip_in_len;
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
     PRINTF("processed_ip_in_len %d, rime_payload_len %d\n", processed_ip_in_len, rime_payload_len);
 
   } else {
@@ -1821,7 +2620,20 @@ input(void)
   if(processed_ip_in_len == 0 || (processed_ip_in_len == sicslowpan_len)) {
     PRINTFI("sicslowpan input: IP packet ready (length %d)\n",
            sicslowpan_len);
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+    if(processed_ip_in_len == 0) {
+      //unfragmented packet
+      memcpy((uint8_t *)UIP_IP_BUF, (uint8_t *)SICSLOWPAN_IP_BUF, sicslowpan_len);
+    } else {
+      //fragmented packet
+      // take fragments from fragment buffer and reassemble the packet
+        fragment_restore_stored(found_entry, UIP_IP_BUF);
+    }
+#else /* SICSLOWPAN_CONF_SPLIT_BUFFER */
     memcpy((uint8_t *)UIP_IP_BUF, (uint8_t *)SICSLOWPAN_IP_BUF, sicslowpan_len);
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
     uip_len = sicslowpan_len;
     sicslowpan_len = 0;
     processed_ip_in_len = 0;
@@ -1845,6 +2657,9 @@ input(void)
       callback->input_callback();
     }
 
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+    found_entry->state = ROUTING_DECISION_TIMEOUT; //Packet received completely, DROP further fragments
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
     tcpip_input();
 #if SICSLOWPAN_CONF_FRAG
   }
@@ -1908,6 +2723,11 @@ sicslowpan_init(void)
 #endif /* SICSLOWPAN_CONF_MAX_ADDR_CONTEXTS > 1 */
 
 #endif /* SICSLOWPAN_COMPRESSION == SICSLOWPAN_COMPRESSION_HC06 */
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+  split_buffer_state_entries_init();
+  split_buffer_init();
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
 }
 /*--------------------------------------------------------------------*/
 int

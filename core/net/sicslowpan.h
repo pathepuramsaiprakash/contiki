@@ -50,6 +50,13 @@
 #include "net/uip.h"
 #include "net/mac/mac.h"
 
+/** \brief Size of the 802.15.4 payload (127byte - 25 for MAC header) */
+#ifdef SICSLOWPAN_CONF_MAC_MAX_PAYLOAD
+#define MAC_MAX_PAYLOAD SICSLOWPAN_CONF_MAC_MAX_PAYLOAD
+#else /* SICSLOWPAN_CONF_MAC_MAX_PAYLOAD */
+#define MAC_MAX_PAYLOAD 102
+#endif /* SICSLOWPAN_CONF_MAC_MAX_PAYLOAD */
+
 /**
  * \name General sicslowpan defines
  * @{
@@ -320,6 +327,77 @@ struct sicslowpan_nh_compressor {
 int sicslowpan_get_last_rssi(void);
 
 extern const struct network_driver sicslowpan_driver;
+
+#ifndef SICSLOWPAN_CONF_FRAG
+#define SICSLOWPAN_CONF_SPLIT_BUFFER 0
+#endif /* SICSLOWPAN_CONF_FRAG */
+#ifndef SICSLOWPAN_CONF_SPLIT_BUFFER
+#define SICSLOWPAN_CONF_SPLIT_BUFFER 0
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
+
+#if SICSLOWPAN_CONF_SPLIT_BUFFER
+
+/* strategy for removing fragments from splitbuffer if a received fragment
+ * can not be stored because the splitbuffer is full
+*/
+#ifndef SICSLOWPAN_REPUTATION_SHORTTIME
+// reputation based on current reassembly window
+#define SICSLOWPAN_REPUTATION_SHORTTIME     0
+#endif /* SICSLOWPAN_REPUTATION_SHORTTIME */
+
+#if SICSLOWPAN_REPUTATION_SHORTTIME
+#ifndef REPUTATION_SHORTTIME_WINDOW
+// window in clocks window is from [a-w, a+w]
+#define REPUTATION_SHORTTIME_WINDOW     32
+#endif /* REPUTATION_SHORTTIME_WINDOW */
+#else /* SICSLOWPAN_REPUTATION_SHORTTIME */
+#define PRIORITIZE_NEW_PACKETS  1
+#endif /* SICSLOWPAN_REPUTATION_SHORTTIME */
+
+//The cache should have more entries for metadata then the fragment-buffer, to buffer DROP decisions, too
+#define SICSLOWPAN_SPLIT_BUFFER_STATE_ENTRIES_MAX 10
+
+enum routing_decision_t {
+  ROUTING_DECISION_EMPTY,
+  ROUTING_DECISION_UNDECIDED,
+  ROUTING_DECISION_KEEP,
+  ROUTING_DECISION_FORWARD,
+  ROUTING_DECISION_DROP,
+  ROUTING_DECISION_TIMEOUT,
+};
+
+struct split_buffer_state_entry_t {
+  enum routing_decision_t  state;
+  rimeaddr_t               src_mac_addr;
+  uint16_t                 fragment_tag;
+  uint16_t                 reassembled_size;
+  clock_time_t             time_firstreceived;
+  uint16_t                 processed_ip_len;
+  uint8_t                  frag2_payload_len;
+#if SICSLOWPAN_REPUTATION_SHORTTIME
+  uint8_t                  rec_fragments;
+  clock_time_t             time_lastreceived;   /** timestamp of the previous 6lowpan fragment processing time */
+  clock_time_t             average_sending_rate; /** average time period between two fragments */
+  uint8_t                  reputation_shorttime; /** short-time reputation based on percentage of packet received and sender behavior */
+#endif /* SICSLOWPAN_REPUTATION_SHORTTIME */
+};
+
+#define SICSLOWPAN_SPLIT_BUFFER_FRAGMENT_LENGTH_MAX    MAC_MAX_PAYLOAD
+
+struct split_buffer_entry_t {
+  struct split_buffer_state_entry_t *split_buffer_state_entry;
+  uint8_t                        data_len;
+  uint8_t                        data[SICSLOWPAN_SPLIT_BUFFER_FRAGMENT_LENGTH_MAX];
+};
+
+void split_buffer_state_entries_init(void);
+struct split_buffer_state_entry_t* split_buffer_state_entry_create(const rimeaddr_t *src, uint16_t tag, uint16_t size);
+struct split_buffer_state_entry_t* split_buffer_state_entry_get(const rimeaddr_t *src, const rimeaddr_t *dst, uint16_t tag, uint16_t size);
+void split_buffer_state_entry_check_timers(void);
+void split_buffer_init();
+void split_buffer_clear_entry(uint8_t i);
+
+#endif /* SICSLOWPAN_CONF_SPLIT_BUFFER */
 
 #endif /* SICSLOWPAN_H_ */
 /** @} */
